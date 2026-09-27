@@ -1474,11 +1474,31 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       this.#provisionMissingAccounts().finally(() => { this.#ensureAccountsPromise = undefined; }));
   }
 
+  // Auto-provisioned accounts whose cached description was refreshed during this object's lifetime.
+  // Their descriptions are otherwise captured once at provisioning, so a gatekeeper that later gains
+  // a management UI or singleton would never surface it to existing users.
+  #refreshedAccountDescriptions = new Set<number>();
+
   async #provisionMissingAccounts(): Promise<void> {
     // Which vendors already have an auto-provisioned account?
     let provisioned = new Set<string>();
     for (let rec of this.#connectedAccountRecords()) {
-      if (rec.autoProvisioned) provisioned.add(rec.vendorId);
+      if (!rec.autoProvisioned) continue;
+      provisioned.add(rec.vendorId);
+      if (this.#refreshedAccountDescriptions.has(rec.id)) continue;
+      this.#refreshedAccountDescriptions.add(rec.id);
+      try {
+        let description = await rec.account.describe();
+        let current = this.storage.connectedAccounts.get(rec.id);
+        if (current && JSON.stringify(current.description) !== JSON.stringify(description)) {
+          current.description = description;
+          this.storage.connectedAccounts.put(current);
+        }
+      } catch (err) {
+        logger.warn("failed to refresh auto-provisioned account description", {
+          event: "account.description.refresh.failed", vendorId: rec.vendorId, error: err,
+        });
+      }
     }
 
     let config = await readAdminConfig(this.env);
