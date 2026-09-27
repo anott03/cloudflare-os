@@ -40,6 +40,15 @@ export interface GitHubRepo {
   resolveRef(ref?: string): Promise<string>;
 
   /**
+   * Export a revision already present on GitHub as a shallow Git pack for a development
+   * sandbox. The pack includes the commit and its complete file tree, preserving binary
+   * files, executable bits, and symlinks. Submodules and Git LFS content are not fetched.
+   * No GitHub credentials are included. The stream is single-use and capped at 64 MiB.
+   * Revisions that exist only as pending pushes cannot be exported yet.
+   */
+  exportCheckout(ref?: string): Promise<GitHubCheckout>;
+
+  /**
    * Looks up a single commit.
    *
    * `ref` may be a full commit id, an unambiguously truncated commit id, a branch name, or a tag
@@ -145,6 +154,14 @@ export interface GitHubRepo {
    * string; the remaining fields are structured filters.
    */
   searchPullRequests(query: GitHubPullRequestSearch): Promise<Cursor<GitHubPullRequestSummary>>;
+}
+
+/** A credential-free shallow checkout exported from this repository. */
+export interface GitHubCheckout {
+  /** Full commit ID. Record this as the shallow boundary when importing the pack. */
+  commitId: string;
+  /** Git pack containing the commit and its file tree, without protocol framing. */
+  pack: ReadableStream<Uint8Array>;
 }
 
 /** A single GitHub issue. */
