@@ -61,6 +61,7 @@ import {
   validateChatAttachmentUpload,
 } from "./chat-attachment-validation";
 import { renderGadgetInBrowser } from "./browser-export";
+import { CodeModeOutput, type CodeModeImage } from "./code-mode-output";
 import {
   defaultExportFormats,
   exportServerFormat,
@@ -78,7 +79,7 @@ import agent from "agent.js";
 
 export default class extends WorkerEntrypoint {
   verify() {}
-  async run(self, callbackResolvers, restoreForger) {
+  async run(self, callbackResolvers, restoreForger, output) {
     let env = this.env;
     if (callbackResolvers) {
       for (let [index, {resolve, reject}] of Object.entries(callbackResolvers)) {
@@ -106,7 +107,7 @@ export default class extends WorkerEntrypoint {
         }
       }
     }
-    let result = await agent(self, env, this.ctx);
+    let result = await agent(self, env, this.ctx, output);
     if (result !== undefined) console.log("Return value:", result);
   }
 }
@@ -184,7 +185,8 @@ interface CodeModeEntrypoint extends WorkerEntrypoint {
         resolve: NativeRpcStub<(v: unknown) => void>,
         reject: NativeRpcStub<(e: unknown) => void>
       }>,
-      restoreForger?: NativeRpcStub<RestoreForgerImpl>): Promise<void>;
+      restoreForger?: NativeRpcStub<RestoreForgerImpl>,
+      output?: NativeRpcStub<CodeModeOutput>): Promise<void>;
 }
 
 interface RestoreForgerEntrypoint extends WorkerEntrypoint {
@@ -8452,6 +8454,13 @@ class OverseerImpl implements AgentHooks {
         }
       }
 
+      if (msg.type === "message") {
+        const images = msg.toolCalls?.flatMap(call => call.toolName === "executeCode" ? call.images ?? [] : []) ?? [];
+        if (images.length > 0) {
+          this.commitChatAttachments(chatId, images);
+          msg.attachments = [...(msg.attachments ?? []), ...images];
+        }
+      }
       this.storage.chats.put({
         chatId,
         sequence,
@@ -8552,7 +8561,8 @@ class OverseerImpl implements AgentHooks {
                         initiator: AiChatAuthorInfo, initiatorModelId: string,
                         bindings: Record<string, ChatBindingEntry>,
                         onOutputText?: (delta: string) => void,
-                        worktreeTurn?: WorktreeTurnAccess)
+                        worktreeTurn?: WorktreeTurnAccess,
+                        onImage?: (image: CodeModeImage) => void)
       : Promise<string> {
     let bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
@@ -8635,12 +8645,27 @@ class OverseerImpl implements AgentHooks {
         }
       }
 
+      this.sweepStagedChatAttachments();
+      using output = new CodeModeOutput(image => {
+        if (!onImage) throw new Error("Image output is unavailable for this execution.");
+        const id = crypto.randomUUID();
+        this.storage.chatAttachmentContent.put({
+          fileId: id, data: image.content,
+          state: { type: "staged", uploadedAt: Date.now(), mimeType: image.mimeType, name: image.name },
+        });
+        try {
+          onImage({ id, mimeType: image.mimeType, name: image.name, size: image.content.byteLength, content: image.content });
+        } catch (error) {
+          this.storage.chatAttachmentContent.delete(id);
+          throw error;
+        }
+      });
       let error: string | undefined;
       try {
         // The forger is a transient stub argument, so the capability to forge persistent
         // gadget-restore stubs lives exactly as long as this run() call.
         await entrypoint.run(selfStub, callbackResolvers,
-            new RestoreForgerImpl(this, chatId, bindings));
+            new RestoreForgerImpl(this, chatId, bindings), output);
       } catch (err) {
         if (err instanceof Error && err.stack) {
           error = err.stack;

@@ -2955,6 +2955,18 @@ export type ChatAttachmentUpload = {
   name?: string;
 };
 
+/** A bounded PNG emitted by agent code for display in chat and input to image-capable models. */
+export type AgentImageOutput = ChatAttachmentUpload & {
+  /** Only PNG images are accepted by the code-output channel. */
+  mimeType: "image/png";
+};
+
+/** Fourth argument supplied to executeCode's exported function. */
+export interface AgentCodeOutput {
+  /** Emit a PNG of at most 1 MiB and 8 megapixels. At most four images and 1 MiB total per step. */
+  image(image: AgentImageOutput): Promise<void>;
+}
+
 /**
  * Handle for an attachment that has been uploaded but not yet sent as part of a message.
  *
@@ -3171,6 +3183,9 @@ export type AiToolCall = {
 
   /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
   output?: string;
+
+  /** Image outputs owned by this chat, stored separately and replayed as tool-result image parts. */
+  images?: ChatAttachmentRef[];
 } | {
   toolName: "giveUp";
   input: {
