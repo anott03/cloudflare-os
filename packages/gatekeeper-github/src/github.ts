@@ -60,6 +60,9 @@ import {
   GitRefUpdateRejectedError,
   ZERO_OID,
   emptyPackBytes,
+  buildGitFetchRequest,
+  demuxGitFetchResponse,
+  MAX_GIT_FETCH_BYTES,
   pullGitObjectsIntoCache,
   pushGitRefUpdate,
   validateBranchName,
@@ -72,6 +75,7 @@ import type {
   GitHubCommitDetails,
   GitHubCommitFilter,
   GitHubCommitSummary,
+  GitHubCheckout,
   GitHubCreateIssueOptions,
   GitHubCreatePullRequestOptions,
   GitHubDiffCommentTarget,
@@ -3583,6 +3587,20 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       oids, hints, cache));
   }
 
+  async exportCheckoutPack(commitId: string): Promise<ReadableStream<Uint8Array>> {
+    const body = buildGitFetchRequest([commitId], {
+      type: "commit",
+      commitHistory: { kind: "depth", depth: 1 },
+    });
+    const response = await this.#withApi(api =>
+      api.fetchGitUploadPack(this.ctx.props.owner, this.ctx.props.repo, body));
+    if (!response.ok || response.body === null) {
+      await response.body?.cancel();
+      throw new Error("GitHub did not return a checkout pack.");
+    }
+    return demuxGitFetchResponse(response.body, MAX_GIT_FETCH_BYTES);
+  }
+
   async applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void> {
     const record = this.#requireActionRecord(actionId);
     if (record.state !== "pending" && record.state !== "staged") {
@@ -5307,6 +5325,25 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
       await this.#gitCache.advertise([id]);
     }
     return id;
+  }
+
+  async exportCheckout(ref?: string): Promise<GitHubCheckout> {
+    const { id, fromCache } =
+      await this.#gatekeeper.resolveRef(ref, await this.#gitCache.stub());
+    if (fromCache) {
+      throw new Error("This revision is not yet confirmed on GitHub. Export an applied revision.");
+    }
+    await this.#approvalQueue.authorizeObservation({
+      title: `Export repository checkout ${id.slice(0, 12)}`,
+      description: `Read the complete file tree at commit ${id} for a development sandbox, ` +
+        "including binary files and symlink targets. GitHub credentials are not exported.",
+    });
+    await this.#gatekeeper.gitPull([id], await this.#gitCache.stub(), {
+      type: "commit",
+      commitHistory: { kind: "depth", depth: 1 },
+      filterTreeDepth: 0,
+    });
+    return { commitId: id, pack: await this.#gatekeeper.exportCheckoutPack(id) };
   }
 
   async getCommit(ref?: string): Promise<GitHubCommitDetails> {
