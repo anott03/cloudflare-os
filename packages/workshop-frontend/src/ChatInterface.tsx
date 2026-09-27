@@ -1897,7 +1897,8 @@ function isAssistantMessageWithoutVisibleText(msg: AiChatMessage): msg is Extrac
     msg.type === "message" &&
     msg.author.type !== "user" &&
     !msg.message.trim() &&
-    !msg.reasoning?.trim()
+    !msg.reasoning?.trim() &&
+    !msg.attachments?.length
   );
 }
 
@@ -6080,6 +6081,13 @@ function ChatInterface({
                                     formats={msg.formats}
                                   />
                                 </div>
+                              )}
+
+                              {msg.attachments && msg.attachments.length > 0 && (
+                                <ChatAttachmentGrid
+                                  attachments={msg.attachments}
+                                  onDownload={(attachment) => { void downloadChatAttachment(msg.chatId, attachment); }}
+                                />
                               )}
 
                               {showActions && (

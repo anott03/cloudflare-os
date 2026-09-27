@@ -4190,6 +4190,20 @@ export type AlwaysAvailableResource = {
   catalog: AgentCatalog | null;
 };
 
+/** A bounded PNG emitted by agent code for display in chat and input to image-capable models. */
+export type AgentImageOutput = {
+  /** Only PNG images are accepted by the code-output channel. */
+  mimeType: "image/png";
+  content: Uint8Array;
+  name?: string;
+};
+
+/** Fourth argument supplied to executeCode's exported function. */
+export interface AgentCodeOutput {
+  /** Emit a PNG of at most 1 MiB and 8 megapixels. At most four images and 1 MiB total per step. */
+  image(image: AgentImageOutput): Promise<void>;
+}
+
 /**
  * A previously uploaded blob to attach to a chat message, with display/model-input metadata.
  * The blob must be present in this workspace's Git store. Attachment limits and MIME signatures
@@ -4474,6 +4488,9 @@ export type AiToolCall = {
 
   /** Output, if the code actually ran. (Otherwise, `error` should be present.) */
   output?: string;
+
+  /** Image outputs owned by this chat, stored separately and replayed as tool-result image parts. */
+  images?: ChatAttachmentRef[];
 } | {
   /**
    * **Obsolete.** Rejected all of the agent's outstanding callbacks with an error. No longer

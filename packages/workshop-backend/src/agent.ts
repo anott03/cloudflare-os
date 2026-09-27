@@ -4,6 +4,8 @@ import { applyCodeChange, codeChangeSerializedSize, MAX_CODE_CHANGE_SIZE, replac
   type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
 import { canInlineChatAttachmentImage, decodeChatAttachmentText, isAllowedChatAttachmentImageMimeType } from './chat-attachment-validation';
+import type { CodeModeImage } from "./code-mode-output";
+import { MAX_AGENT_IMAGE_BYTES } from "@gadgets/workshop-shared/png";
 import { AgentCatalog, ObservationDescription } from '@gadgets/workshop-shared/gatekeeper';
 import { createWorkshopLogger, obsContext } from "./observability";
 import { createTracer } from "@gadgets/observability/tracing";
@@ -536,7 +538,8 @@ export interface AgentHooks {
                    initiator: AiChatAuthorInfo, initiatorModelId: string,
                    bindings: Record<string, ChatBindingEntry>,
                    onOutputText?: (delta: string) => void,
-                   worktreeTurn?: WorktreeTurnAccess): Promise<string>;
+                   worktreeTurn?: WorktreeTurnAccess,
+                   onImage?: (image: CodeModeImage) => void): Promise<string>;
   consumeCapturedActions(chatId: number)
       : {actions: number[], accessedGadget: boolean, awaitDecision: boolean} | undefined;
   emitChatStreamEvent(chatId: number, event: AiChatStreamEvent): void;
@@ -2326,7 +2329,7 @@ async function runAgentPass(
           for (let toolCall of msg.toolCalls) {
             // Recreate the tool output: the exact text the model sees, plus the error flag.
             // TODO: Refactor so that we're not duplicating tool implementations...
-            let toolOutput: {text: string, isError?: boolean};
+            let toolOutput: {text: string, isError?: boolean, images?: ImageContent[]};
             try {
               if (toolCall.error) {
                 toolOutput = {text: `${toolCall.error}`, isError: true};
@@ -2508,6 +2511,13 @@ async function runAgentPass(
                 }
                 case "executeCode":
                   toolOutput = {text: toolCall.output!};
+                  if (handle.model.input.includes("image") && toolCall.images?.length) {
+                    toolOutput.images = await Promise.all(toolCall.images.map(async image => ({
+                      type: "image" as const,
+                      data: (await hooks.getChatAttachmentData(chatId, image.id)).toBase64(),
+                      mimeType: image.mimeType,
+                    })));
+                  }
                   break;
                 case "giveUp":
                   // Obsolete tool: no longer offered, replayed for old chat logs only.
@@ -2576,7 +2586,7 @@ async function runAgentPass(
               role: "toolResult",
               toolCallId: toolCall.toolCallId,
               toolName: toolCall.toolName,
-              content: [{type: "text", text: toolOutput.text}],
+              content: [{type: "text", text: toolOutput.text}, ...(toolOutput.images ?? [])],
               isError: toolOutput.isError ?? false,
               timestamp: msgTimestamp,
             });
@@ -2888,6 +2898,8 @@ async function runAgentPass(
   // needs (the error text, plus e.g. observedCodeVersion) here before rethrowing.
   // Success-path notes ride the tool result's `details` instead.
   let toolCallNotes = new Map<string, Partial<AiToolCall>>();
+  let stepImageBytes = 0;
+  let stepImageCount = 0;
 
   // Renders a thrown tool error exactly the way pi renders it into the live error tool result
   // (an Error contributes its message, anything else is stringified), so the persisted `error`
@@ -3810,7 +3822,7 @@ async function runAgentPass(
               "which exports a single async function, like so:\n" +
               "\n" +
               "```\n" +
-              "export default async function(self, env, ctx) {\n" +
+              "export default async function(self, env, ctx, output) {\n" +
               "  // ... code to execute ...\n" +
               "}\n" +
               "```\n" +
@@ -3818,7 +3830,11 @@ async function runAgentPass(
               "`env` and `ctx` are the usual objects passed to Cloudflare Workers event " +
               "handlers. `env` contains the bindings, and `ctx` contains various functions " +
               "and information related to the execution context. `self` is a magic object " +
-              "that points back to this chat thread.",
+              "that points back to this chat thread. `output.image({mimeType: \"image/png\", " +
+              "content: pngBytes, name: \"preview.png\"})` displays an image in chat and returns " +
+              "it to image-capable models. Await the call. Supply PNG bytes from a binding, " +
+              "not base64 or a URL. Images are limited to 1 MiB, 8 megapixels, width 4096 and " +
+              "height 8192. Emit at most four images and 1 MiB total per step.",
         }),
       }),
       execute: async (toolCallId, {code}) => {
@@ -3834,6 +3850,7 @@ async function runAgentPass(
                 "step ends. End this response and call executeCode again in your next step.");
           }
 
+          const images: CodeModeImage[] = [];
           let output = await hooks.executeCodeMode(
               chatId, code, initiator, author.id, Object.fromEntries(chatBindings),
               delta => emitStreamEvent({
@@ -3841,8 +3858,26 @@ async function runAgentPass(
                 toolCallId,
                 delta,
               }),
-              worktreeTurnAccess);
-          return toolResult(`${output}`, {output: `${output}`} as Partial<AiToolCall>);
+              worktreeTurnAccess,
+              image => {
+                if (stepImageCount >= 4 || stepImageBytes + image.content.byteLength > MAX_AGENT_IMAGE_BYTES) {
+                  throw new Error("Emit at most four images and 1 MiB total per agent step.");
+                }
+                stepImageCount++;
+                stepImageBytes += image.content.byteLength;
+                images.push(image);
+              });
+          const imageParts: ImageContent[] = handle.model.input.includes("image")
+            ? images.map(image => ({ type: "image", mimeType: image.mimeType, data: image.content.toBase64() }))
+            : [];
+          if (images.length > 0) {
+            output += `\nImages: ${images.map(image => image.name ?? "image.png").join(", ")}.`;
+            if (imageParts.length === 0) output += " This model does not support image input; the images are visible to the user.";
+          }
+          return {
+            content: [{ type: "text" as const, text: output }, ...imageParts],
+            details: { output, images: images.map(({ content: _content, ...reference }) => reference) },
+          };
         } catch (error) {
           toolCallNotes.set(toolCallId, {
             error: toolErrorText(error)
@@ -4194,6 +4229,8 @@ async function runAgentPass(
 
         // Reset per-step streaming state.
         toolCallNotes.clear();
+        stepImageBytes = 0;
+        stepImageCount = 0;
         executeCodeStreamManager.clear();
         break;
       }
