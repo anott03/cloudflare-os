@@ -33,6 +33,12 @@
 import type { GitOid, GitPullHints, GitPullStatus } from "@gadgets/workshop-shared/gatekeeper";
 import { readBytesCapped, ResponseTooLargeError } from "./response-body";
 
+export class GitFetchSizeError extends Error {
+  constructor(maxBytes: number) {
+    super(`git fetch response exceeded the ${maxBytes}-byte transfer limit`);
+  }
+}
+
 /** The `agent` capability sent with every request, mirroring the REST layer's User-Agent. */
 const GIT_AGENT = "cloudflare-gadgets";
 
@@ -319,7 +325,7 @@ async function* demuxPackData(
       let value = result.value;
       received += value.byteLength;
       if (received > maxBytes) {
-        throw new Error(`git fetch response exceeded the ${maxBytes}-byte transfer limit`);
+        throw new GitFetchSizeError(maxBytes);
       }
       for (let item of parser.push(value)) {
         if (item.kind === "delim" || item.kind === "response-end") continue;

@@ -55,6 +55,7 @@ import {
   type PinnedRepo,
 } from "./github-api";
 import { getBasePath, getBaseUrl, webhookOrigin, type Env } from "./github-env";
+import { CheckoutSpool } from "./checkout-spool";
 import {
   HOOKS_NOT_CONFIGURED, handleWebhookRequest,
   type GitHubEventHookTarget, type GitHubHookDelivery, type GitHubHookParams,
@@ -81,7 +82,6 @@ import {
   ZERO_OID,
   emptyPackBytes,
   buildGitFetchRequest,
-  demuxGitFetchResponse,
   pushGitRefUpdate,
   simulateBranchHead,
   validateBranchName,
@@ -156,7 +156,6 @@ import { obsContext } from "./observability.js";
 export { GitHubHookController, GitHubHookDriver } from "./github-hooks";
 
 const VENDOR_ID = "github";
-const MAX_CHECKOUT_BYTES = 64 << 20;
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.github", vendorId: VENDOR_ID,
@@ -1418,6 +1417,17 @@ export class UserAccount extends DurableObject<Env> {
       this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback"), VENDOR_ID),
   };
 
+  #checkoutSpool = new CheckoutSpool(this.ctx.storage);
+
+  async spoolCheckoutPack(body: ReadableStream<Uint8Array>): Promise<ReadableStream<Uint8Array>> {
+    try {
+      return await this.#checkoutSpool.capture(async () => body);
+    } catch (error) {
+      await body.cancel().catch(() => {});
+      throw error;
+    }
+  }
+
   async setCallback(callback: Fetcher<GatekeeperConnectCallback>, initiationNonce: string,
                     requestedScopes?: string[], ephemeral?: boolean): Promise<void> {
     if (!this.#creds.stored()) {
@@ -1514,6 +1524,7 @@ export class UserAccount extends DurableObject<Env> {
     }
 
     await this.ctx.storage.deleteAlarm();
+    await this.#checkoutSpool.scheduleAlarm();
     return handoff;
   }
 
@@ -1562,6 +1573,8 @@ export class UserAccount extends DurableObject<Env> {
     // grant (used once to read the email for login).
     if (!this.#creds.stored() || this.ctx.storage.kv.get<boolean>("ephemeral")) {
       await this.ctx.storage.deleteAll();
+    } else {
+      await this.#checkoutSpool.alarm();
     }
   }
 
@@ -4014,7 +4027,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       await response.body?.cancel();
       throw new Error("GitHub did not return a checkout pack.");
     }
-    return demuxGitFetchResponse(response.body, MAX_CHECKOUT_BYTES);
+    return this.#userAccount().spoolCheckoutPack(response.body);
   }
 
   async applyAction(actionId: number, cache: RpcStub<GitCache>): Promise<void> {

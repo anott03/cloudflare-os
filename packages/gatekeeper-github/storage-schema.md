@@ -1,6 +1,6 @@
 # GitHub Gatekeeper Storage Schema
 
-This gatekeeper uses Durable Object KV storage only. It does not use SQLite tables.
+This gatekeeper uses Durable Object KV storage for account and repository state, and a temporary SQLite table for checkout exports.
 
 ## Design choices
 
@@ -22,7 +22,31 @@ Keys:
 - `expiredNotified`, `expiredNotifiedArm` -> the kit's expiry latch, so `credentialsExpired()` is only sent once per dead grant. Every credential replacement re-arms it.
 - `reconnecting` -> boolean flag indicating an in-progress reconnect flow.
 
-No per-user SQL tables are used.
+### Temporary checkout spool
+
+`checkout_chunks(sequence INTEGER PRIMARY KEY, data BLOB NOT NULL)` holds one checkout
+export per account, in chunks of at most 256 KiB. The existing 64 MiB limit applies to the
+raw upload-pack response, including protocol framing and progress, before the export call
+returns its pack stream. Chunk writes are synchronized before reading more input, and output
+reads load one chunk at a time. Concurrent exports on the same account are rejected rather
+than accumulating storage.
+
+The non-facet `UserAccount` owns the spool because Durable Object facets cannot set alarms.
+The repository facet still fetches the same upload-pack response with the same credentials;
+it sends that body to the account for validation and temporary storage. This does not use
+or invalidate the repository metadata cache or rebuild packs from the workspace GitCache.
+
+Chunks are deleted on consumption, cancellation, or failure. An alarm removes abandoned
+exports after ten minutes from the start of spooling. Earlier account lifecycle alarms take
+precedence; completing OAuth restores the spool deadline after clearing the OAuth alarm.
+Account reconstruction deletes orphaned chunks, since output streams cannot survive a
+restart. The durable alarm also wakes an otherwise idle account for cleanup. A completed
+export can leave a harmless alarm scheduled until its deadline.
+
+This adds temporary SQLite writes and a full-download delay before returning a checkout.
+The pack is not buffered in Worker memory and is not validated as a Git object database here;
+the consumer still verifies the pack. SQL deletion removes live rows, not historical PITR
+backups or necessarily the database's allocated pages.
 
 ## GitHubGatekeeperImpl Durable Object
 

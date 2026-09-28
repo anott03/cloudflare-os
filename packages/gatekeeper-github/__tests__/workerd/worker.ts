@@ -10,7 +10,7 @@
 
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cloudflare:workers";
 import type {
-  AccountDescription, ActionDescription, ActionKind, ConnectHandoff, GatekeeperUser, GitCache, HookController,
+  AccountDescription, ActionDescription, ActionKind, ApprovalQueue, ConnectHandoff, GatekeeperUser, GitCache, HookController,
   HookDescription, GitPullHints, GitPullTransfer,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { GitHubGatekeeperImpl, GitHubHookDriver as GitHubHookDriverImpl, type GitHubVerifierApi } from "../../src/github.js";
@@ -18,6 +18,8 @@ import type { GitHubHookParams } from "../../src/github-hooks.js";
 import type {
   Cursor,
   GitHubBranchSummary,
+  GitHubCheckout,
+  GitHubRepo as GitHubRepoSession,
   GitHubCommitDetails,
   GitHubCommitFilter,
   GitHubCommitSummary,
@@ -167,6 +169,7 @@ type SeedFacet = { seed(entries: Record<string, unknown>): Promise<void> };
 // return-type inference collapses several of these returns to `never` (its `Serializable`
 // heuristic gives up on them), while the runtime objects are exactly the production ones.
 type GatekeeperFacet = Pick<GitHubGatekeeperImpl, "gitPull"> & {
+  startSession: GitHubGatekeeperImpl["startSession"];
   preparePush(branch: string, commitId: string, force: boolean, cache: RpcStub<GitCache>)
     : Promise<PushActionData | null>;
   prepareCreatePullRequest(options: GitHubCreatePullRequestOptions)
@@ -263,6 +266,17 @@ export class TestHooks extends DurableObject<Cloudflare.Env> {
     const user = (this.ctx.exports as unknown as TestExports)
       .GatekeeperUserImpl({ props: { userObjectId: "unused" } });
     return await outcome(async () => (await user.getGatekeeperClassFor(url)).resource.urlPattern);
+  }
+
+  async exportCheckout(
+    facetName: string, props: GatekeeperProps, queue: RpcStub<ApprovalQueue>, ref: string,
+  ): Promise<Outcome<GitHubCheckout>> {
+    return outcome(async () => {
+      if (props.resourceKind !== "repo") throw new Error("Expected a repository");
+      // SAFETY: repo-scoped startSession returns a repository session over Workers RPC.
+      using session = await this.#gatekeeper(facetName, props).startSession(queue) as GitHubRepoSession & Disposable;
+      return await session.exportCheckout(ref);
+    });
   }
 
   async preparePush(
