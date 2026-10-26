@@ -1,9 +1,10 @@
-import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
+import { DurableObject, RpcStub, RpcTarget, exports } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type {
   AnthropicMessagesCompat, Api, AssistantMessageEventStream, ClassifierApi, ClassifierContext,
   ClassifierModel, ClassifierOptions, ClassifierResult, Context, FetchFunction, Model, ModelCost,
-  OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction, Usage,
+  OpenAICompletionsCompat, OpenAIResponsesCompat, ProviderHeaders, SimpleStreamOptions,
+  StreamFunction, Usage,
 } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, getSupportedThinkingLevels, normalizeContext }
   from "@earendil-works/pi-ai";
@@ -197,6 +198,7 @@ const CATALOGS: Partial<Record<AiModelProvider, Record<string, Model<Api>>>> = {
   openai: OPENAI_MODELS,
   google: GOOGLE_MODELS,
   cloudflare: CLOUDFLARE_WORKERS_AI_MODELS,
+  chatgpt: OPENAI_MODELS,
 };
 
 // Consult pi's builtin catalog for cost/compat metadata of a known model id. Unknown models are
@@ -743,6 +745,11 @@ function signGeminiFunctionCalls(model: Model<Api>, payload: unknown): object | 
 export function getModel(env: Cloudflare.Env, config: AiModelConfig,
                          initiator: AiChatAuthorInfo,
                          options: ModelRoutingOptions = {}): ModelHandle {
+  // The user's ChatGPT subscription pays, whatever AI Gateway or billing the deployment has.
+  if (config.provider === "chatgpt") {
+    return getModelViaChatGpt(config, initiator, options.sessionAffinity);
+  }
+
   // BYOK: a connected user's own Cloudflare account pays for everything (all providers, including
   // Workers AI), routed through the user's own AI Gateway with unified billing. Honored regardless
   // of whether a platform AI Gateway is configured, so connected users are always billed correctly.
@@ -760,6 +767,63 @@ export function getModel(env: Cloudflare.Env, config: AiModelConfig,
   }
 
   return getModelDirect(config, options.sessionAffinity);
+}
+
+// pi sends a Sign in with ChatGPT request without the fields that grant rejects when the model is
+// OpenAI's own endpoint and its key is no `sk-` key, so the handle's key is this stand-in and the
+// real token replaces it on every request (see chatGptFetch).
+const CHATGPT_KEY_PLACEHOLDER = "chatgpt-subscription";
+
+// A fetch that authorizes each request with the current Sign in with ChatGPT token of the user
+// `initiator` is accounted to, refreshed by their ChatGPT gatekeeper connection as needed.
+function chatGptFetch(initiator: AiChatAuthorInfo): FetchFunction {
+  return async (input, init) => {
+    if (initiator.type === "agent") {
+      throw new Error("ChatGPT models run on behalf of a user.");
+    }
+    const users = exports.UserDurableObject;
+    const token = await users.get(users.idFromName(initiator.id)).getChatGptAccessToken();
+    if (token === null) {
+      throw new Error(
+          "ChatGPT is not connected, or its sign-in expired. Connect ChatGPT under Connectors.");
+    }
+    const request = new Request(input, init);
+    request.headers.set("Authorization", `Bearer ${token}`);
+    return fetch(request);
+  };
+}
+
+// OpenAI's Responses API on a ChatGPT subscription. The subscription rejects explicit prompt-cache
+// breakpoints, so the model is described without GPT-5.6 prompt caching, which also leaves its
+// requests unsplit and never resent to keep a cache warm. Usage is the subscription's, not priced
+// per token.
+function getModelViaChatGpt(config: AiModelConfig, initiator: AiChatAuthorInfo,
+                            sessionAffinity?: string): ModelHandle {
+  const catalog = catalogModel("chatgpt", config.model);
+  const window = modelTokenWindow(config, catalog);
+  // SAFETY: the chatgpt catalog is pi's OpenAI catalog, whose chat models all speak
+  // openai-responses and so carry its compat.
+  const { supportsExplicitPromptCacheMode, ...compat } =
+      (catalog?.compat ?? {}) as OpenAIResponsesCompat;
+  return makeHandle({
+    model: {
+      id: config.model,
+      name: catalog?.name ?? config.model,
+      api: "openai-responses",
+      provider: "openai",
+      baseUrl: "https://api.openai.com/v1",
+      reasoning: catalog?.reasoning ?? true,
+      input: catalog?.input ?? ["text", "image"],
+      cost: ZERO_COST,
+      ...window,
+      thinkingLevelMap: catalog?.thinkingLevelMap,
+      compat: { ...compat, supportsLongCacheRetention: false },
+    },
+    apiKey: CHATGPT_KEY_PLACEHOLDER,
+    fetch: chatGptFetch(initiator),
+    sessionAffinity,
+    reasoning: config.reasoning,
+  });
 }
 
 // Route inference through the user's own account (unified billing) via their account's default AI
@@ -1033,6 +1097,8 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         ...directAuth(config, "Authorization"),
         sessionAffinity,
       });
+    case "chatgpt":
+      throw new Error("ChatGPT models are routed by getModel().");
     default:
       config.provider satisfies never;
       throw new Error(`Unknown provider "${config.provider}".`);

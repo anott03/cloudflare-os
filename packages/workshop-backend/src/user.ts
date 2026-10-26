@@ -1,8 +1,9 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type WebPushSubscription } from '@gadgets/workshop-shared/api';
+import { CONNECTED_ACCOUNT_PROVIDERS, GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, NotificationMute, UserNotification, type DeviceSessionHandoffStart, type WebPushSubscription } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame, GatekeeperUserSelection, GatekeeperUserSelectionExchange, RedeemedGatekeeperUserSelection } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
+import { CHATGPT_VENDOR_ID, ChatGptGatekeeperUser } from "@gadgets/workshop-shared/chatgpt-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
@@ -656,8 +657,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     // Also include user-configured models, where users may add their own, skipping any that a
     // gateway model shadows, whatever its mode (see #resolveModel()).
-    if (models && !models.userModels) return result;
     for (let model of this.storage.aiModels.list()) {
+      if (models && !models.userModels &&
+          !CONNECTED_ACCOUNT_PROVIDERS.has(model.config.provider)) {
+        continue;
+      }
       if (!models?.get(model.profile.id) &&
           modelKind(model.config.provider, model.config.model) === kind) {
         result.push(model.profile);
@@ -669,7 +673,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   async addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
                  copySecretsFrom?: string): Promise<void> {
     let models = await getGatewayModels(this.env);
-    models?.refuseUserModel();
+    if (!CONNECTED_ACCOUNT_PROVIDERS.has(config.provider)) models?.refuseUserModel();
     let source: AiModelConfig | undefined;
     if (copySecretsFrom !== undefined) {
       source = this.#getHandAddedModel(copySecretsFrom, models).config;
@@ -688,7 +692,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async updateModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig): Promise<void> {
     let models = await getGatewayModels(this.env);
-    models?.refuseUserModel();
+    if (!CONNECTED_ACCOUNT_PROVIDERS.has(config.provider)) models?.refuseUserModel();
     let stored = this.#getHandAddedModel(profile.id, models).config;
     if (config.provider !== stored.provider || config.model !== stored.model) {
       throw new Error("A model's provider and model ID can't be changed.");
@@ -707,7 +711,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   #putModel(profile: AiChatAuthorInfo, config: AiModelConfig, models: GatewayModels | null) {
-    if (models && !models.providers.has(config.provider)) {
+    if (models && !models.providers.has(config.provider) &&
+        !CONNECTED_ACCOUNT_PROVIDERS.has(config.provider)) {
       throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
     }
     for (let limit of [config.contextWindow, config.outputLimit]) {
@@ -784,6 +789,23 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       if (rec && rec.vendorId === CLOUDFLARE_VENDOR_ID) {
         return rec.account as unknown as Fetcher<CloudflareGatekeeperUser>;
       }
+    }
+    return null;
+  }
+
+  /**
+   * DO NOT MAKE PUBLIC -- returns a credential. A usable Sign in with ChatGPT access token from the
+   * user's connected ChatGPT gatekeeper account, which runs the models of provider "chatgpt". Null
+   * if the user hasn't connected ChatGPT or its credentials expired.
+   */
+  async getChatGptAccessToken(): Promise<string | null> {
+    for (let rec of this.#connectedAccountRecords()) {
+      if (rec.vendorId !== CHATGPT_VENDOR_ID || !areCredentialsValid(rec)) continue;
+      // SAFETY: only the ChatGPT gatekeeper's accounts carry its vendor id, and they implement
+      // ChatGptGatekeeperUser.
+      let account = rec.account as unknown as Fetcher<ChatGptGatekeeperUser>;
+      let token = await account.getUsableAccessToken().catch(() => null);
+      if (token !== null) return token;
     }
     return null;
   }
@@ -910,7 +932,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    */
   #resolveModel(id: string, models: GatewayModels | null): UserAiModelRecord | undefined {
     if (models?.get(id)) return models.resolve(id);
-    return models && !models.userModels ? undefined : this.storage.aiModels.get(id);
+    let stored = this.storage.aiModels.get(id);
+    if (stored && CONNECTED_ACCOUNT_PROVIDERS.has(stored.config.provider)) return stored;
+    return models && !models.userModels ? undefined : stored;
   }
 
   async listGadgets(): Promise<GadgetMetadataWithTimestamps[]> {

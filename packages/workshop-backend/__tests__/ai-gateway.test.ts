@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  SUGGESTED_MODELS, type AiModelProvider, type GatewayModel, type GatewayModelCapabilities,
+  CONNECTED_ACCOUNT_PROVIDERS, SUGGESTED_MODELS, type AiModelProvider, type GatewayModel,
+  type GatewayModelCapabilities,
 } from "@gadgets/workshop-shared/api";
 import { serializeAdminConfig } from "../src/admin-config.js";
 import { DEFAULT_ADMIN_CONFIG, type AdminConfig } from "../src/storage-schema/admin-settings-storage.js";
@@ -697,7 +698,8 @@ describe("GatewayModels", () => {
   // added model it offers is one that can run. This holds the two in step.
   it.each(Object.keys(SUGGESTED_MODELS) as AiModelProvider[])(
       "offers an added model on %s only if the gateway can route it", (provider) => {
-    const unroutable = (() => {
+    // getModel runs these on the user's own connection, never through the gateway.
+    const unroutable = CONNECTED_ACCOUNT_PROVIDERS.has(provider) || (() => {
       try {
         getModel(gatewayEnv(provider), { provider, model: "test-model", apiToken: "" }, USER);
         return false;

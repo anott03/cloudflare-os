@@ -1719,7 +1719,8 @@ export type CloudflareAccountOption = {
 };
 
 /** Supported AI providers. */
-export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" | "ollama";
+export type AiModelProvider =
+    "openai" | "anthropic" | "google" | "cloudflare" | "ollama" | "chatgpt";
 
 /** Information about the AI gateway configuration. Returned by `AuthenticatedApi.getAiConfig()`. */
 export type AiGatewayInfo = {
@@ -2161,6 +2162,14 @@ const SUGGESTED_MODEL_CATALOG = {
   },
   "ollama": {
   },
+  // OpenAI models reached with a Sign in with ChatGPT token from the user's connected ChatGPT
+  // gatekeeper, billed to their ChatGPT subscription. The subscription serves a smaller window
+  // than the API key does.
+  "chatgpt": {
+    "gpt-6.1-sol": {name: "GPT-6.1 Sol (ChatGPT)", contextWindow: 500000, outputLimit: 128000},
+    "gpt-6-luna": {name: "GPT-6 Luna (ChatGPT)", contextWindow: 272000, outputLimit: 128000},
+    "gpt-6-astra": {name: "GPT-6 Astra (ChatGPT)", contextWindow: 272000, outputLimit: 128000},
+  },
 } satisfies Record<AiModelProvider, Record<string, SuggestedModel>>;
 
 /**
@@ -2193,6 +2202,14 @@ export function modelKind(provider: string, model: string): ModelKind {
  * https://github.com/earendil-works/pi/blob/v0.84.2/packages/ai/src/api/google-vertex.ts#L98
  */
 export const HTTPS_ONLY_PROVIDERS: ReadonlySet<string> = new Set<AiModelProvider>(["google"]);
+
+/**
+ * Providers whose models run on credentials from one of the user's connected gatekeeper accounts
+ * rather than through AI Gateway or a key in the model config. A user adds their models even on an
+ * AI Gateway deployment, and the gateway never serves them.
+ */
+export const CONNECTED_ACCOUNT_PROVIDERS: ReadonlySet<string> =
+    new Set<AiModelProvider>(["chatgpt"]);
 
 /**
  * Metadata about a workspace (one Overseer DO and everything in it). Includes everything needed

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Dialog, Button, Input, Select, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
-import { AiChatAuthorInfo, AiModelProvider, AiGatewayInfo, RedactedAiModelConfig, SUGGESTED_MODELS, modelKind } from '@gadgets/workshop-shared/api'
+import { AiChatAuthorInfo, AiModelProvider, AiGatewayInfo, CONNECTED_ACCOUNT_PROVIDERS, RedactedAiModelConfig, SUGGESTED_MODELS, modelKind } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 import { ExtraHeadersEditor } from './features/ai-models/ExtraHeadersEditor'
@@ -9,6 +9,9 @@ import {
   headerRowsFromRecord, headerRowsToRecord, validateHeaderRows, type HeaderRow,
 } from './features/ai-models/extraHeaders'
 import { PROVIDER_LABELS, parseTokenLimit } from './features/ai-models/modelForm'
+import { openConnectWindow } from './connectHandoff'
+import { AuthPopupCancelledError } from './features/native-app/authPopup'
+import { CHATGPT_VENDOR_ID } from '@gadgets/workshop-shared/chatgpt-gatekeeper'
 
 /**
  * Whether the modal adds a model from scratch, edits a stored one, or adds a model based on a
@@ -40,6 +43,7 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
   google: 'AIza...',
   cloudflare: 'Cloudflare API token',
   ollama: '(optional)',
+  chatgpt: '',
 }
 
 // Providers whose client can send no API key at all, so a proxy that extra headers authenticate
@@ -47,8 +51,13 @@ const API_TOKEN_PLACEHOLDERS: Record<AiModelProvider, string> = {
 // SDK always sends a key, and the Workers AI endpoint can't be redirected to a proxy.
 const TOKEN_OPTIONAL_WITH_HEADERS: ReadonlySet<AiModelProvider> = new Set(['anthropic', 'openai'])
 
+// Whether a model of `provider` takes credentials in its own config: not one that runs on a
+// connected account, nor any on an AI Gateway deployment, whose gateway supplies them.
+const takesCredentials = (gatewayMode: boolean, provider: AiModelProvider | undefined) =>
+  !gatewayMode && !(provider && CONNECTED_ACCOUNT_PROVIDERS.has(provider))
+
 const isTokenRequired = (provider: AiModelProvider, headerRows: readonly HeaderRow[]) =>
-  provider !== 'ollama' &&
+  provider !== 'ollama' && !CONNECTED_ACCOUNT_PROVIDERS.has(provider) &&
   !(TOKEN_OPTIONAL_WITH_HEADERS.has(provider) && headerRowsToRecord(headerRows) !== undefined)
 
 // Example used in the custom-model placeholders for providers that have no suggested models
@@ -84,10 +93,12 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
   const providerOrder = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
 
   for (const provider of providerOrder) {
-    if (enabledProviders && !enabledProviders.has(provider)) continue
+    const connected = CONNECTED_ACCOUNT_PROVIDERS.has(provider)
+    if (enabledProviders && !enabledProviders.has(provider) && !connected) continue
 
-    // In gateway mode, suggested models are already built-in, so don't list them.
-    if (!gatewayMode) {
+    // In gateway mode, suggested models are already built-in, so don't list them. The gateway
+    // serves none of a connected-account provider's, so those are listed either way.
+    if (!gatewayMode || connected) {
       for (const [modelId, model] of Object.entries(SUGGESTED_MODELS[provider])) {
         if (model.hidden || (chatModelsOnly && model.kind === 'decision')) continue
         options.push({
@@ -117,6 +128,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const editing = mode.type === 'edit'
 
   const [loading, setLoading] = useState(false)
+  const [connecting, setConnecting] = useState(false)
   const [selection, setSelection] = useState<SelectionType | null>(
     source && { type: 'custom', provider: source.config.provider })
   const [selectValue, setSelectValue] = useState<string | undefined>(undefined)
@@ -208,7 +220,7 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
 
     const isOllama = selection?.provider === 'ollama'
     const isCloudflare = selection?.provider === 'cloudflare'
-    const showCredentials = !gatewayMode
+    const showCredentials = takesCredentials(gatewayMode, selection?.provider)
 
     if (showCredentials && selection && isTokenRequired(selection.provider, headerRows) && effectiveApiToken?.trim() === '') {
       newErrors.apiToken = apiToken === null
@@ -260,20 +272,25 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
 
       const profile: AiChatAuthorInfo = {
         type: 'agent',
-        // A model's ID is its identity to chats and settings, so editing never changes it.
-        id: editing ? source!.profile.id : finalModelId,
+        // A model's ID is its identity to chats and settings, so editing never changes it. A
+        // connected-account provider's models share their API IDs with the gateway's own, so their
+        // IDs carry the provider.
+        id: editing ? source!.profile.id
+          : CONNECTED_ACCOUNT_PROVIDERS.has(selection!.provider)
+            ? `${selection!.provider}/${finalModelId}` : finalModelId,
         name: finalDisplayName,
       }
 
-      const extraHeaders = gatewayMode ? undefined : headerRowsToRecord(headerRows)
+      const credentials = takesCredentials(gatewayMode, selection!.provider)
+      const extraHeaders = credentials ? headerRowsToRecord(headerRows) : undefined
       const contextWindowTokens = parseTokenLimit(contextWindow)
       const outputLimitTokens = parseTokenLimit(outputLimit)
       const config: RedactedAiModelConfig = {
         provider: selection!.provider,
         model: finalModelId,
-        apiToken: gatewayMode ? '' : effectiveApiToken?.trim() ?? null,
-        ...(!gatewayMode && accountId.trim() && { accountId: accountId.trim() }),
-        ...(!gatewayMode && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
+        apiToken: credentials ? effectiveApiToken?.trim() ?? null : '',
+        ...(credentials && accountId.trim() && { accountId: accountId.trim() }),
+        ...(credentials && apiUrl.trim() && { apiUrl: apiUrl.trim() }),
         ...(extraHeaders && { extraHeaders }),
         ...(contextWindowTokens && { contextWindow: contextWindowTokens }),
         ...(outputLimitTokens && { outputLimit: outputLimitTokens }),
@@ -298,12 +315,29 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     }
   }
 
+  // The Connectors page lists only gatekeepers offering resources, which ChatGPT does not, so its
+  // connection starts here.
+  const connectChatGpt = async () => {
+    setConnecting(true)
+    try {
+      await openConnectWindow(
+        await authenticatedApi.connectAccount(CHATGPT_VENDOR_ID, []), authenticatedApi)
+    } catch (error) {
+      if (error instanceof AuthPopupCancelledError) return
+      toasts.add({ title: 'Could not connect ChatGPT',
+        description: error instanceof Error ? error.message : undefined, variant: 'error' })
+    } finally {
+      setConnecting(false)
+    }
+  }
+
   const options = buildOptions(gatewayMode, enabledProviders, chatModelsOnly)
   const showCustomFields = selection?.type === 'custom'
   const example = selection ? exampleModel(selection.provider) : null
   const isOllama = selection?.provider === 'ollama'
   const isCloudflare = selection?.provider === 'cloudflare'
-  const showCredentials = !gatewayMode
+  const isChatGpt = selection !== null && CONNECTED_ACCOUNT_PROVIDERS.has(selection.provider)
+  const showCredentials = takesCredentials(gatewayMode, selection?.provider)
   const tokenRequired = selection !== null && isTokenRequired(selection.provider, headerRows)
   const title = { add: 'Add AI Model', edit: 'Edit AI Model', clone: 'Clone AI Model' }[mode.type]
 
@@ -388,6 +422,18 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
                 variant={errors.displayName ? 'error' : 'default'}
               />
             </>
+          )}
+
+          {isChatGpt && (
+            <div className="space-y-2">
+              <p className="text-sm text-kumo-subtle">
+                Runs on your ChatGPT subscription. Connect ChatGPT once before chatting with this
+                model; the connection then appears under Connectors.
+              </p>
+              <Button variant="secondary" size="sm" loading={connecting} onClick={connectChatGpt}>
+                Connect ChatGPT
+              </Button>
+            </div>
           )}
 
           {/* Cloudflare account ID (the Workers AI REST endpoint is account-scoped) */}

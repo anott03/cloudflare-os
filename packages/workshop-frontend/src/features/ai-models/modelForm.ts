@@ -11,6 +11,7 @@ export const PROVIDER_LABELS: Record<AiModelProvider, string> = {
   google: 'Google',
   cloudflare: 'Cloudflare Workers AI',
   ollama: 'Ollama',
+  chatgpt: 'ChatGPT subscription',
 }
 
 /** Each reasoning level's name as the Models tab shows it. */

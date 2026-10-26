@@ -19,6 +19,10 @@
       "types": "./src/cloudflare-gatekeeper.ts",
       "import": "./src/cloudflare-gatekeeper.ts"
     },
+    "./chatgpt-gatekeeper": {
+      "types": "./src/chatgpt-gatekeeper.ts",
+      "import": "./src/chatgpt-gatekeeper.ts"
+    },
     "./png": {
       "types": "./src/png.ts",
       "import": "./src/png.ts"
